@@ -1,0 +1,23 @@
+name: macOS verification
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Optional local conversion engines
+        run: brew install ffmpeg webp
+      - name: Build and XCTest
+        run: swift test --disable-sandbox
+      - name: Executable smoke checks
+        run: python3 scripts/cli-smoke.py .build/debug/FileOrbit
+      - name: Bundle app without deleting earlier artifacts
+        run: scripts/build-app.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: FileOrbit-macOS-preview
+          path: dist/*/FileOrbit-macOS.zip

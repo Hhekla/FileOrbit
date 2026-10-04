@@ -1,0 +1,26 @@
+#!/bin/bash
+set -euo pipefail
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+cd "$ROOT"
+VERSION="${FILEORBIT_VERSION:-0.1.0-alpha.3}"
+CONFIG="${FILEORBIT_CONFIGURATION:-release}"
+export CLANG_MODULE_CACHE_PATH="${CLANG_MODULE_CACHE_PATH:-$ROOT/.build/clang-cache}"
+export SWIFTPM_MODULECACHE_OVERRIDE="${SWIFTPM_MODULECACHE_OVERRIDE:-$ROOT/.build/swift-cache}"
+swift build --disable-sandbox --configuration "$CONFIG" --cache-path .build/cache --config-path .build/config --security-path .build/security
+BIN="$(swift build --disable-sandbox --configuration "$CONFIG" --show-bin-path --cache-path .build/cache --config-path .build/config --security-path .build/security)"
+mkdir -p "$ROOT/dist"
+OUT="$(mktemp -d "$ROOT/dist/FileOrbit-$VERSION.XXXXXX")"
+APP="$OUT/FileOrbit.app"
+mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
+cp "$BIN/FileOrbit" "$APP/Contents/MacOS/FileOrbit"
+sed -e "s/__VERSION__/$VERSION/g" -e 's/__BUILD__/1/g' Resources/Info.plist > "$APP/Contents/Info.plist"
+cp LICENSE NOTICE.md THIRD_PARTY.md "$APP/Contents/Resources/"
+swift scripts/make-icon.swift "$OUT/FileOrbit.iconset"
+iconutil -c icns "$OUT/FileOrbit.iconset" -o "$APP/Contents/Resources/AppIcon.icns"
+codesign --force --sign - "$APP"
+codesign --verify --strict --verbose=2 "$APP"
+ditto -c -k --sequesterRsrc --keepParent "$APP" "$OUT/FileOrbit-macOS.zip"
+shasum -a 256 "$OUT/FileOrbit-macOS.zip" > "$OUT/SHA256SUMS.txt"
+echo "APP=$APP"
+echo "ZIP=$OUT/FileOrbit-macOS.zip"
+# Every run creates a new output folder; it never deletes a prior release.
