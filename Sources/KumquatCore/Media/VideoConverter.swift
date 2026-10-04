@@ -84,10 +84,22 @@ public enum VideoConverter {
         }
         return try await OutputNaming.write(to: destination) { out in
             // Try a lossless rewrap first (e.g. MKV with H.264 + AAC), then fall back to re-encoding.
-            let copy = try await ExternalTools.run(ffmpeg, ["-y", "-loglevel", "error", "-i", input.path,
+            let copy = try await ExternalTools.run(ffmpeg, ["-y", "-nostdin", "-loglevel", "error", "-i", input.path,
+                                                            "-map", "0:v:0", "-map", "0:a:0?",
                                                             "-c", "copy", "-movflags", "+faststart", out.path])
-            if copy.status != 0 {
-                try await ExternalTools.runChecked(ffmpeg, ["-y", "-loglevel", "error", "-i", input.path,
+            // Some muxers accept codec tags they cannot read back (for example
+            // WMAv2 audio in MOV). A zero exit status alone is not a valid file.
+            let decodable: Bool
+            if copy.status == 0 {
+                let check = try await ExternalTools.run(ffmpeg, ["-nostdin", "-loglevel", "error", "-xerror",
+                    "-i", out.path, "-map", "0:v:0", "-map", "0:a:0?", "-t", "0.1", "-f", "null", "-"])
+                decodable = check.status == 0
+            } else {
+                decodable = false
+            }
+            if !decodable {
+                try await ExternalTools.runChecked(ffmpeg, ["-y", "-nostdin", "-loglevel", "error", "-i", input.path,
+                                                            "-map", "0:v:0", "-map", "0:a:0?",
                                                             "-c:v", "libx264", "-crf", "20", "-preset", "medium",
                                                             "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k",
                                                             "-movflags", "+faststart", out.path])
@@ -144,15 +156,13 @@ public enum AnimatedImageVideo {
             AVVideoCompressionPropertiesKey: [
                 AVVideoAverageBitRateKey: max(800_000, width * height * 6),
                 AVVideoProfileLevelKey: AVVideoProfileLevelH264HighAutoLevel,
+                // Reordered B frames can make VideoToolbox replace the final
+                // variable sample duration with the preceding frame's delay.
+                AVVideoAllowFrameReorderingKey: false,
             ],
         ]
         let input = AVAssetWriterInput(mediaType: .video, outputSettings: settings)
         input.expectsMediaDataInRealTime = false
-        let adaptor = AVAssetWriterInputPixelBufferAdaptor(assetWriterInput: input, sourcePixelBufferAttributes: [
-            kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32ARGB,
-            kCVPixelBufferWidthKey as String: width,
-            kCVPixelBufferHeightKey as String: height,
-        ])
         guard writer.canAdd(input) else { throw KumquatError.encodeFailed(output.lastPathComponent) }
         writer.add(input)
         guard writer.startWriting() else {
@@ -171,7 +181,7 @@ public enum AnimatedImageVideo {
                 try await Task.sleep(nanoseconds: 2_000_000)
             }
             guard let buffer = pixelBuffer(for: frame, width: width, height: height),
-                  adaptor.append(buffer, withPresentationTime: CMTime(seconds: time, preferredTimescale: 600)) else {
+                  let sample = timedSample(buffer, start: time, duration: delay), input.append(sample) else {
                 throw KumquatError.encodeFailed("frame \(i + 1)")
             }
             time += delay
@@ -182,6 +192,22 @@ public enum AnimatedImageVideo {
         if writer.status != .completed {
             throw KumquatError.processFailed(writer.error?.localizedDescription ?? "Couldn't write the video.")
         }
+    }
+
+    /// Pixel-buffer adaptors omit sample duration, so the final animation frame
+    /// can inherit the preceding delay and truncate a variable-timing GIF.
+    static func timedSample(_ buffer: CVPixelBuffer, start: Double, duration: Double) -> CMSampleBuffer? {
+        var description: CMVideoFormatDescription?
+        guard CMVideoFormatDescriptionCreateForImageBuffer(allocator: kCFAllocatorDefault,
+                imageBuffer: buffer, formatDescriptionOut: &description) == noErr,
+              let description else { return nil }
+        var timing = CMSampleTimingInfo(duration: CMTime(seconds: duration, preferredTimescale: 600),
+                                       presentationTimeStamp: CMTime(seconds: start, preferredTimescale: 600),
+                                       decodeTimeStamp: .invalid)
+        var sample: CMSampleBuffer?
+        guard CMSampleBufferCreateReadyWithImageBuffer(allocator: kCFAllocatorDefault, imageBuffer: buffer,
+                formatDescription: description, sampleTiming: &timing, sampleBufferOut: &sample) == noErr else { return nil }
+        return sample
     }
 
     static func pixelBuffer(for image: CGImage, width: Int, height: Int) -> CVPixelBuffer? {
@@ -204,4 +230,3 @@ public enum AnimatedImageVideo {
         return buffer
     }
 }
-

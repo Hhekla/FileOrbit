@@ -6,6 +6,8 @@ dist/
 DerivedData/
 .DS_Store
 *.o
+__pycache__/
+*.pyc
 
 
 # Generated previews are verified separately; do not publish unreviewed images.

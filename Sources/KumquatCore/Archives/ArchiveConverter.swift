@@ -13,7 +13,7 @@ public enum ArchiveConverter {
         public init() {}
     }
 
-    static let archiveExtensions: Set<String> = ["zip", "tar", "gz", "tgz", "rar"]
+    static let archiveExtensions: Set<String> = ["zip", "tar", "gz", "gzip", "tgz", "rar"]
 
     /// Archives a regular file/directory, or transcodes supported archives without writing their
     /// contents to disk. GZIP is a single-file stream: multi-file inputs produce a .tar.gz.
@@ -205,7 +205,7 @@ public enum ArchiveConverter {
             do {
                 try check(library.readSupportFilterAll(a))
                 try check(library.readSupportFormatAll(a))
-                if input.pathExtension.lowercased() == "gz" {
+                if ["gz", "gzip"].contains(input.pathExtension.lowercased()) {
                     let handle = try FileHandle(forReadingFrom: input)
                     defer { try? handle.close() }
                     guard try handle.read(upToCount: 2) == Data([0x1f, 0x8b]) else { throw unsafe("GZIP 文件头无效") }
@@ -282,7 +282,12 @@ public enum ArchiveConverter {
             guard let a = library.writeNew() else { throw unsafe("不能初始化系统压缩引擎") }
             archive = a
             do {
-                if format == .zip { try check(lib.writeSetFormatZip(a)) }
+                if format == .zip {
+                    try check(lib.writeSetFormatZip(a))
+                    // Explicit charset also sets ZIP's UTF-8 flag. Without it libarchive can
+                    // write UTF-8 bytes marked as CP437, corrupting names in other readers.
+                    try check(lib.writeSetFormatOption(a, "zip", "hdrcharset", "UTF-8"))
+                }
                 else if format == .gz && !gzipTar { try check(lib.writeSetFormatRaw(a)) }
                 else { try check(lib.writeSetFormatPax(a)) }
                 if format == .gz { try check(lib.writeAddFilterGzip(a)) }
@@ -332,6 +337,7 @@ final class ArchiveLibrary {
     typealias SetUInt = @convention(c) (OpaquePointer, UInt32) -> Void
     typealias SetSize = @convention(c) (OpaquePointer, Int64) -> Void
     typealias Header = @convention(c) (OpaquePointer, OpaquePointer) -> Int32
+    typealias FormatOption = @convention(c) (OpaquePointer, UnsafePointer<CChar>, UnsafePointer<CChar>, UnsafePointer<CChar>) -> Int32
     let handle: UnsafeMutableRawPointer
     let readNew: New, writeNew: New, entryNew: New
     let readSupportFilterAll: One, readSupportFormatAll: One, readSupportFormatRaw: One
@@ -343,6 +349,7 @@ final class ArchiveLibrary {
     let entryFiletype: EntryType, entrySize: Size, entryFree: FreeEntry
     let entrySetPathname: SetName, entrySetFiletype: SetUInt, entrySetPerm: SetUInt, entrySetSize: SetSize
     let writeHeader: Header
+    let writeSetFormatOption: FormatOption
 
     init() throws {
         guard let library = dlopen("/usr/lib/libarchive.2.dylib", RTLD_LOCAL | RTLD_NOW) else {
@@ -387,6 +394,7 @@ final class ArchiveLibrary {
             entrySetPerm = try load("archive_entry_set_perm", as: SetUInt.self)
             entrySetSize = try load("archive_entry_set_size", as: SetSize.self)
             writeHeader = try load("archive_write_header", as: Header.self)
+            writeSetFormatOption = try load("archive_write_set_format_option", as: FormatOption.self)
         } catch { dlclose(library); throw error }
     }
     deinit { dlclose(handle) }

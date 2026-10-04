@@ -2,7 +2,7 @@
 
 一款面向 macOS 的本地文件转换与处理工具，提供中文工作台、拖放轮盘和命令行入口。把文件加入工作台，或在 Finder 中拖动文件时按住 **⇧ Shift**，即可选择当前文件可用的转换格式；**⌥ Option + ⇧ Shift** 打开工具轮盘。
 
-**当前版本：0.1.0-alpha.3。** 这是一个早期开源版本，源码见 [Hhekla/FileOrbit](https://github.com/Hhekla/FileOrbit)。当前以源码构建为主要使用方式，尚未提供经过 Apple 公证的正式安装包。它已实现多类常用操作，但尚不能宣称完全替代 Tangerine，也未完成对其全部选项的逐项等效验收。可用范围、依赖和明确限制见 [功能说明](docs/FEATURES.md)。
+**当前版本：0.1.0-alpha.5。** 这是一个早期开源版本，源码见 [Hhekla/FileOrbit](https://github.com/Hhekla/FileOrbit)。当前以源码构建为主要使用方式，尚未提供经过 Apple 公证的正式安装包。它已实现多类常用操作，但尚不能宣称完全替代 Tangerine，也未完成对其全部选项的逐项等效验收。可用范围、依赖和明确限制见 [功能说明](docs/FEATURES.md)。
 
 FileOrbit 从 MIT 许可的 [Kumquat](https://github.com/kelvin715/Kumquat) 派生，基线提交为 `dc51f9005b58f99aeec82748e8d7fb54d1fee5bf`。保留了上游版权和许可证；来源与修改说明见 [NOTICE](NOTICE.md)。本项目与 Tangerine、Apple 或 Kumquat 上游维护者没有官方关联。
 
@@ -15,7 +15,7 @@ FileOrbit 从 MIT 许可的 [Kumquat](https://github.com/kelvin715/Kumquat) 派�
 | 文档 | DOC/DOCX、RTF、ODT、HTML、TXT、Markdown 等文档的读取和支持格式输出 |
 | 影音 | 格式转换、音轨提取、剪辑、压缩、静音、旋转、截图；可选 FFmpeg 提供变速、拼接、分段、声道和目标大小等 |
 | 字幕 | SRT/VTT 互转及导出 TXT，保留时间戳和多行内容 |
-| 压缩包 | ZIP/TAR/GZIP 互转、受限安全解压；RAR 读取取决于系统支持，尚未实测验收 |
+| 压缩包 | ZIP/TAR/GZIP 互转、受限安全解压；已实测压缩及 solid RAR5 的读取转换，不支持 RAR 创建 |
 
 转换在本机框架或用户安装的本机辅助工具中执行，不需要账户、订阅或大模型服务。结果保存到原文件旁边，自动选择未占用的文件名；批处理分别报告成功、失败与取消。
 
@@ -67,7 +67,7 @@ PDF 转 Word 提供两个明确模式：
 
 ## 可选辅助工具
 
-FileOrbit **不打包、不自动下载安装** FFmpeg、ffprobe、cwebp 或 gif2webp。用户可自行选择可信来源安装。例如，已使用 Homebrew 的用户可以执行：
+FileOrbit **不打包、不自动下载安装** FFmpeg、ffprobe、cwebp、webpmux 或 gif2webp。用户可自行选择可信来源安装。例如，已使用 Homebrew 的用户可以执行：
 
 ```sh
 brew install ffmpeg webp
@@ -75,9 +75,9 @@ brew install ffmpeg webp
 
 | 工具 | 作用 |
 | --- | --- |
-| FFmpeg + ffprobe | 更多音视频格式及高级影音操作；具体编码器仍取决于安装的构建版本 |
+| FFmpeg + ffprobe | 更多音视频格式及高级影音操作；部分 EXR 采用 FFmpeg 解码回退，具体编码器仍取决于安装的构建版本 |
 | cwebp | 可选 WebP 编码器；没有它时仍有内置静态 WebP 路径 |
-| gif2webp | GIF 动画转 WebP 的首选路径；也可使用含 `libwebp_anim` 的 FFmpeg |
+| gif2webp / cwebp + webpmux | GIF/APNG 转动画 WebP，保留已验证样例的帧、时长和循环次数；也可尝试含 `libwebp_anim` 的 FFmpeg |
 
 检测到工具不代表它具备所有编码器。在 GIF→WebP 路径中，缺少所需编码器或无法保持动画时会报错，不会将第一帧伪装成完整动画转换结果。安装后可在设置中查看 FFmpeg/cwebp 的检测情况。第三方工具的许可独立于本项目，见 [THIRD_PARTY](THIRD_PARTY.md)。
 
@@ -106,7 +106,11 @@ swift run FileOrbit tool split clip.mp4 --end 10
 
 ## 当前验证
 
-已执行 96 个测试方法，全部通过，零失败、零跳过。本机没有 XCTest，使用仓库内明确标注的独立断言适配器运行原测试体；不能将此记录称为原生 XCTest 通过。覆盖范围和证据见 [验证记录](docs/VALIDATION.md)。
+alpha.5 已对分类器明确列出的 **82 个输入后缀**核对菜单，并真实尝试全部 **679 条输入后缀→输出格式方向，未尝试项为 0**。后缀包含别名，679 不是格式种数，也不代表全部成功。仍有 27 次 RAW 样例失败：Fuji S5000 的 RAF、Olympus E-10 的 ORF、Samsung NX500 的 SRW 各 9 种输出；其他机型的同后缀样例已通过。另有明确拒绝和保真受限的案例，详见 [实际转换报告](docs/ACTUAL-CONVERSION-REPORT.md)。
+
+本次修复了已发现的 DOCX 标题/列表丢失、扫描 PDF 加表单时漏正文、多页 TIFF 缺页和部分动画时长/循环问题。复杂 DOCX 的页眉页脚（含纯图片）、脚注、公式和未实现的复杂编号仍明确拒绝；PDF 表单的 6 项外观对照仍有纵向位置差异。纯文字 RTFD/Webarchive 的 14 条转换均通过，不能据此推及带附件的所有文档。
+
+最终 119 项回归测试全部通过，零失败、零跳过。本机使用仓库内明确标注的独立断言适配器运行原测试体，不能称为原生 XCTest 通过。alpha.4 的 283 次实际尝试和 102 项回归等历史记录见 [验证记录](docs/VALIDATION.md)。测试方法数与转换方向数分开统计。
 
 仅有 Command Line Tools 时可执行：
 
@@ -118,6 +122,6 @@ bash scripts/verify-core.sh
 
 ## 当前边界与参与方式
 
-SVG、复杂 Office 高保真、多轨影音完整保留、带定位/样式的字幕转换、扫描 PDF OCR 准确率和广泛兼容性仍未完成。RAR 只尝试系统支持的读取，未承诺创建或兼容全部 RAR 变体。当前能力不是“188 个选项已全部替代”的结论。
+SVG、复杂 Office 高保真、多轨影音完整保留、带定位/样式的字幕转换、扫描 PDF OCR 准确率和广泛兼容性仍未完成。RAW 兼容性取决于具体相机与编码；EXR 回退使用 16 位中间图像，不承诺完整 HDR 保真。RAR 只尝试系统支持的读取，未承诺创建或兼容全部 RAR 变体。当前能力不是“188 个选项已全部替代”的结论。
 
 完整边界见 [功能说明](docs/FEATURES.md)，开发与验证要求见 [CONTRIBUTING](CONTRIBUTING.md)。本项目代码依 [MIT License](LICENSE) 提供；分发时请保留上游许可、[NOTICE](NOTICE.md) 和 [第三方说明](THIRD_PARTY.md)。

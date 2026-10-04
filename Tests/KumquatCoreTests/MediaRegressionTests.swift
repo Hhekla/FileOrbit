@@ -1,4 +1,7 @@
 import Foundation
+import CoreGraphics
+import ImageIO
+import UniformTypeIdentifiers
 import XCTest
 @testable import KumquatCore
 
@@ -133,6 +136,181 @@ final class MediaRegressionTests: XCTestCase {
             XCTAssertTrue(info.audio, format.title)
             XCTAssertFalse(info.video, format.title)
             XCTAssertGreaterThan(info.duration, 1.4, format.title)
+        }
+    }
+
+    func testWMVToMOVRetainsDecodablePictureAndSound() async throws {
+        let dir = try directory()
+        let source = try await fixture(dir, video: true)
+        let wmv = dir.appendingPathComponent("windows-media.wmv")
+        try await ExternalTools.runChecked(ffmpeg, MediaOperations.common + ["-i", source.path,
+            "-c:v", "wmv2", "-c:a", "wmav2", "-ar", "44100", "-ac", "2", wmv.path])
+        let original = try Data(contentsOf: wmv)
+        let outputs = try await VideoConverter.convert(wmv, to: .mov, options: .init(), capabilities: capabilities)
+        let result = try XCTUnwrap(outputs.first)
+        // FFmpeg accepts a MOV containing unrecognized WMAv2 audio when stream
+        // copying. Require the result to actually decode, including its sound.
+        try await ExternalTools.runChecked(ffmpeg, ["-nostdin", "-v", "error", "-xerror", "-i", result.path,
+            "-map", "0:v:0", "-map", "0:a:0", "-f", "null", "-"])
+        let info = try await MediaOperations.probe(result, ffmpeg: ffmpeg)
+        XCTAssertTrue(info.video)
+        XCTAssertTrue(info.audio)
+        XCTAssertEqual(info.duration, 1.6, accuracy: 0.1)
+        XCTAssertEqual(try Data(contentsOf: wmv), original)
+    }
+
+    func testMPEGAndTransportStreamAudioCanBecomeFLAC() async throws {
+        let dir = try directory()
+        let source = try await fixture(dir, video: true)
+        for ext in ["mpg", "ts"] {
+            let input = dir.appendingPathComponent("container").appendingPathExtension(ext)
+            let encoding = ext == "mpg"
+                ? ["-c:v", "mpeg2video", "-r", "25", "-c:a", "mp2", "-f", "mpeg"]
+                : ["-c:v", "libx264", "-c:a", "aac", "-f", "mpegts"]
+            try await ExternalTools.runChecked(ffmpeg, MediaOperations.common + ["-i", source.path] + encoding + [input.path])
+            let original = try Data(contentsOf: input)
+            let outputs = try await AudioConverter.convert(input, to: .flac, capabilities: capabilities)
+            let output = try XCTUnwrap(outputs.first)
+            try await ExternalTools.runChecked(ffmpeg, ["-nostdin", "-v", "error", "-xerror", "-i", output.path,
+                "-map", "0:a:0", "-f", "null", "-"])
+            let info = try await MediaOperations.probe(output, ffmpeg: ffmpeg)
+            XCTAssertTrue(info.audio)
+            XCTAssertFalse(info.video)
+            XCTAssertEqual(info.duration, 1.6, accuracy: 0.15)
+            XCTAssertEqual(try Data(contentsOf: input), original)
+        }
+    }
+
+    func testSurroundConversionPreservesSixChannels() async throws {
+        let dir = try directory()
+        let source = dir.appendingPathComponent("surround.wav")
+        try await ExternalTools.runChecked(ffmpeg, MediaOperations.common + ["-f", "lavfi", "-i",
+            "aevalsrc=0.1*sin(2*PI*220*t)|0.1*sin(2*PI*330*t)|0.1*sin(2*PI*440*t)|0.1*sin(2*PI*60*t)|0.1*sin(2*PI*660*t)|0.1*sin(2*PI*880*t):s=48000:d=1.6:c=5.1",
+            "-c:a", "pcm_s16le", source.path])
+        let original = try Data(contentsOf: source)
+        for format in [OutputFormat.m4a, .aiff, .flac] {
+            let outputs = try await AudioConverter.convert(source, to: format, capabilities: capabilities)
+            let output = try XCTUnwrap(outputs.first)
+            try await ExternalTools.runChecked(ffmpeg, ["-nostdin", "-v", "error", "-xerror", "-i", output.path,
+                "-map", "0:a:0", "-f", "null", "-"])
+            let info = try await MediaOperations.probe(output, ffmpeg: ffmpeg)
+            XCTAssertEqual(info.channels, 6, format.title)
+            XCTAssertEqual(info.duration, 1.6, accuracy: 0.1)
+        }
+        XCTAssertEqual(try Data(contentsOf: source), original)
+    }
+
+    func testNativeAudioExportDoesNotMixAlternativeLanguageTracks() async throws {
+        let dir = try directory()
+        let source = dir.appendingPathComponent("languages.mp4")
+        try await ExternalTools.runChecked(ffmpeg, MediaOperations.common + ["-f", "lavfi", "-i",
+            "testsrc2=size=160x120:rate=20:duration=1.6", "-f", "lavfi", "-i",
+            "sine=frequency=440:sample_rate=48000:duration=1.6", "-f", "lavfi", "-i",
+            "sine=frequency=880:sample_rate=48000:duration=1.6", "-map", "0:v", "-map", "1:a", "-map", "2:a",
+            "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", source.path])
+        let outputs = try await AudioConverter.convert(source, to: .wav, capabilities: capabilities)
+        let output = try XCTUnwrap(outputs.first)
+        let raw = dir.appendingPathComponent("selected-track.pcm")
+        try await ExternalTools.runChecked(ffmpeg, MediaOperations.common + ["-i", output.path,
+            "-ar", "8000", "-ac", "1", "-f", "s16le", raw.path])
+        let data = try Data(contentsOf: raw)
+        let samples = stride(from: 4000, to: min(data.count - 1, 12000), by: 2).map { i in
+            Double(Int16(bitPattern: UInt16(data[i]) | (UInt16(data[i + 1]) << 8))) / 32768
+        }
+        func power(_ frequency: Double) -> Double {
+            let coefficient = 2 * cos(2 * .pi * frequency / 8000)
+            var s1 = 0.0, s2 = 0.0
+            for sample in samples {
+                let s0 = sample + coefficient * s1 - s2
+                s2 = s1; s1 = s0
+            }
+            return sqrt(max(0, s1 * s1 + s2 * s2 - coefficient * s1 * s2))
+        }
+        XCTAssertGreaterThan(power(440), 10)
+        XCTAssertLessThan(power(880) / power(440), 0.06, "The second language track must not be mixed into the first")
+        let warnings = await MediaSupport.conversionWarnings(for: source, to: .wav, capabilities: capabilities)
+        XCTAssertTrue(warnings.contains { $0.contains("第一条音轨") })
+    }
+
+    func testAnimatedMP4RetainsUnequalFinalFrameDuration() async throws {
+        let dir = try directory()
+        for delays in [[0.2, 0.4], [0.4, 0.2]] {
+            let input = dir.appendingPathComponent("timing-\(delays[0]).gif")
+            let destination = try XCTUnwrap(CGImageDestinationCreateWithURL(input as CFURL,
+                UTType.gif.identifier as CFString, 2, nil))
+            for (index, delay) in delays.enumerated() {
+                let context = try XCTUnwrap(CGContext(data: nil, width: 32, height: 32, bitsPerComponent: 8,
+                    bytesPerRow: 0, space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue))
+                context.setFillColor(index == 0 ? CGColor(red: 1, green: 0, blue: 0, alpha: 1)
+                                               : CGColor(red: 0, green: 1, blue: 0, alpha: 1))
+                context.fill(CGRect(x: 0, y: 0, width: 32, height: 32))
+                CGImageDestinationAddImage(destination, try XCTUnwrap(context.makeImage()),
+                    [kCGImagePropertyGIFDictionary: [kCGImagePropertyGIFDelayTime: delay]] as CFDictionary)
+            }
+            XCTAssertTrue(CGImageDestinationFinalize(destination))
+            let original = try Data(contentsOf: input)
+            let outputs = try await ImageConverter.convert(input, to: .mp4, options: .init(), capabilities: capabilities)
+            let result = try XCTUnwrap(outputs.first)
+            let info = try await MediaOperations.probe(result, ffmpeg: ffmpeg)
+            XCTAssertEqual(info.duration, 0.6, accuracy: 0.005)
+            let tail = dir.appendingPathComponent("tail-\(delays[0]).rgb")
+            try await ExternalTools.runChecked(ffmpeg, MediaOperations.common + ["-i", result.path,
+                "-vf", "fps=20", "-ss", "0.55", "-frames:v", "1", "-pix_fmt", "rgb24", "-f", "rawvideo", tail.path])
+            let pixels = try Data(contentsOf: tail)
+            XCTAssertEqual(pixels.count, 32 * 32 * 3, "The final frame must still be visible at 0.55 seconds")
+            if pixels.count >= 3 {
+                XCTAssertGreaterThan(Int(pixels[1]), 200, "The end of the clip retains the green final frame")
+                XCTAssertLessThan(Int(pixels[0]), 40)
+            }
+            XCTAssertEqual(try Data(contentsOf: input), original)
+        }
+    }
+
+    func testAnimatedMP4RetainsThreeAndFourVariableFrameDurations() async throws {
+        let dir = try directory()
+        let timings = [[0.1, 0.3, 0.6], [0.6, 0.3, 0.1], [0.1, 0.4, 0.2, 0.3]]
+        let colors: [[CGFloat]] = [[1, 0, 0], [0, 0, 1], [0, 1, 0], [1, 1, 0]]
+        for (variant, delays) in timings.enumerated() {
+            let source = dir.appendingPathComponent("variable-frames-\(variant).gif")
+            let destination = try XCTUnwrap(CGImageDestinationCreateWithURL(source as CFURL,
+                UTType.gif.identifier as CFString, delays.count, nil))
+            for (index, delay) in delays.enumerated() {
+                let context = try XCTUnwrap(CGContext(data: nil, width: 32, height: 32, bitsPerComponent: 8,
+                    bytesPerRow: 0, space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue))
+                let color = colors[index]
+                context.setFillColor(CGColor(red: color[0], green: color[1], blue: color[2], alpha: 1))
+                context.fill(CGRect(x: 0, y: 0, width: 32, height: 32))
+                CGImageDestinationAddImage(destination, try XCTUnwrap(context.makeImage()),
+                    [kCGImagePropertyGIFDictionary: [kCGImagePropertyGIFDelayTime: delay]] as CFDictionary)
+            }
+            XCTAssertTrue(CGImageDestinationFinalize(destination))
+            let outputs = try await ImageConverter.convert(source, to: .mp4, options: .init(), capabilities: capabilities)
+            let output = try XCTUnwrap(outputs.first)
+            let info = try await MediaOperations.probe(output, ffmpeg: ffmpeg)
+            XCTAssertEqual(info.duration, delays.reduce(0, +), accuracy: 0.005)
+            var start = 0.0
+            for (index, delay) in delays.enumerated() {
+                let sample = dir.appendingPathComponent("color-\(variant)-\(index).rgb")
+                try await ExternalTools.runChecked(ffmpeg, MediaOperations.common + ["-i", output.path,
+                    "-ss", String(start + delay / 2), "-frames:v", "1", "-vf", "fps=100,scale=1:1", "-pix_fmt", "rgb24", "-f", "rawvideo", sample.path])
+                // DeviceRGB can be color-converted while the GIF fixture is
+                // encoded. Compare against its actual independently decoded
+                // pixels, not the pre-encoding nominal RGB components.
+                let sourceSample = dir.appendingPathComponent("source-color-\(variant)-\(index).rgb")
+                try await ExternalTools.runChecked(ffmpeg, MediaOperations.common + ["-i", source.path,
+                    "-ss", String(start + delay / 2), "-frames:v", "1", "-vf", "fps=100,scale=1:1", "-pix_fmt", "rgb24", "-f", "rawvideo", sourceSample.path])
+                let pixels = try Data(contentsOf: sample)
+                let expected = try Data(contentsOf: sourceSample)
+                XCTAssertEqual(pixels.count, 3)
+                XCTAssertEqual(expected.count, 3)
+                if pixels.count == 3 && expected.count == 3 {
+                    for channel in 0..<3 {
+                        XCTAssertEqual(Double(pixels[channel]), Double(expected[channel]), accuracy: 30,
+                            "Frame \(index) must remain visible for its own delay")
+                    }
+                }
+                start += delay
+            }
         }
     }
 

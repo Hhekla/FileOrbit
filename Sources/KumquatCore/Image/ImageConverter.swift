@@ -7,10 +7,34 @@ public enum ImageConverter {
     public static func convert(_ input: URL, to format: OutputFormat, options: ConversionOptions,
                                capabilities: Capabilities) async throws -> [URL] {
         try ImageIOHelpers.requireRasterInput(input)
+        try rejectUnsupportedAPNGPoster(input)
         if format == .svg {
             throw KumquatError.processFailed("SVG vectorization is not supported. No SVG was written; embedding a bitmap would not create vector artwork.")
         }
         let destination = OutputNaming.convertedURL(for: input, ext: format.fileExtension)
+        if ["tif", "tiff"].contains(input.pathExtension.lowercased()),
+           CGImageSourceGetCount(try ImageIOHelpers.source(input)) > 1,
+           ![OutputFormat.pdf, .docx].contains(format) {
+            throw KumquatError.processFailed("多页 TIFF 不能转换为只保留第一页的图片。请转换为 PDF 或 DOCX 以保留全部页面；未生成缺页文件。")
+        }
+        // ImageIO advertises EXR but cannot decode every valid floating-point EXR.
+        // Use FFmpeg's decoder when available, retaining 16-bit RGBA for the
+        // intermediate raster instead of failing all offered targets outright.
+        if input.pathExtension.lowercased() == "exr",
+           (try? ImageIOHelpers.loadImage(input)) == nil,
+           let ffmpeg = capabilities.ffmpegURL {
+            return [try await OutputNaming.write(to: destination) { out in
+                let directory = FileManager.default.temporaryDirectory
+                    .appendingPathComponent("FileOrbit-exr-\(UUID().uuidString)")
+                try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+                let png = directory.appendingPathComponent("decoded.png")
+                try await ExternalTools.runChecked(ffmpeg, ["-y", "-loglevel", "error", "-i", input.path,
+                                                            "-frames:v", "1", "-pix_fmt", "rgba64be", png.path])
+                let converted = try await convert(png, to: format, options: options, capabilities: capabilities)
+                guard let result = converted.first else { throw KumquatError.encodeFailed(input.lastPathComponent) }
+                try FileManager.default.copyItem(at: result, to: out)
+            }]
+        }
         switch format {
         case .jpg, .png, .heic, .tiff, .bmp, .gif:
             return [try OutputNaming.write(to: destination) { try writeImageIO(input, to: $0, format: format, options: options) }]
@@ -19,6 +43,11 @@ public enum ImageConverter {
                 return [try OutputNaming.write(to: destination) { try writeImageIO(input, to: $0, format: .avif, options: options) }]
             }
             guard let ffmpeg = capabilities.ffmpegURL else { throw KumquatError.toolMissing("ffmpeg") }
+            // The SVT-AV1 fallback only accepts opaque YUV420. Dropping alpha here
+            // produces a valid-looking file with black/changed transparent regions.
+            guard !ImageIOHelpers.hasTransparency(try ImageIOHelpers.loadImage(input)) else {
+                throw KumquatError.processFailed("当前 AVIF 编码器无法保留透明区域。请改用 PNG 或 WebP；未生成丢失透明度的文件。")
+            }
             return [try await OutputNaming.write(to: destination) { out in
                 try await withTemporaryPNG(of: input) { png in
                     try await ExternalTools.runChecked(ffmpeg, ["-y", "-loglevel", "error", "-i", png.path,
@@ -38,6 +67,33 @@ public enum ImageConverter {
             return [try await OutputNaming.write(to: destination) { try await AnimatedImageVideo.writeMP4(from: input, to: $0) }]
         default:
             throw KumquatError.unsupportedConversion(from: input.pathExtension.uppercased(), to: format.title)
+        }
+    }
+
+    /// On the supported macOS decoder, an APNG with a separate default poster
+    /// can return the final animation frame for every index. Refuse that variant
+    /// instead of publishing a valid file containing the wrong picture/animation.
+    static func rejectUnsupportedAPNGPoster(_ input: URL) throws {
+        guard ["png", "apng"].contains(input.pathExtension.lowercased()) else { return }
+        let handle = try FileHandle(forReadingFrom: input)
+        defer { try? handle.close() }
+        guard try handle.read(upToCount: 8) == Data([137, 80, 78, 71, 13, 10, 26, 10]) else { return }
+        var animated = false
+        var firstFrameControl = false
+        while let header = try handle.read(upToCount: 8), header.count == 8 {
+            let bytes = [UInt8](header)
+            let length = bytes.prefix(4).reduce(UInt64(0)) { ($0 << 8) | UInt64($1) }
+            let kind = String(bytes: bytes.suffix(4), encoding: .ascii)
+            if kind == "acTL" { animated = true }
+            if kind == "fcTL" { firstFrameControl = true }
+            if kind == "IDAT" {
+                if animated && !firstFrameControl {
+                    throw KumquatError.processFailed("此 APNG 含独立封面，当前系统解码器无法正确读取动画画面。请先导出为普通 PNG 或 GIF；未生成画面错误的文件。")
+                }
+                return
+            }
+            if kind == "IEND" { return }
+            try handle.seek(toOffset: handle.offset() + length + 4)
         }
     }
 
@@ -82,7 +138,22 @@ public enum ImageConverter {
             if format == .tiff { ImageIOHelpers.applyLZW(&destProps) }
             CGImageDestinationAddImage(dest, image, destProps as CFDictionary)
         }
-        guard CGImageDestinationFinalize(dest) else { throw KumquatError.encodeFailed(output.lastPathComponent) }
+        if CGImageDestinationFinalize(dest) { return }
+        guard keepsOrientationTag && !(opaqueOnly && sourceHasAlpha) else {
+            throw KumquatError.encodeFailed(output.lastPathComponent)
+        }
+        // Some RAW containers decode successfully but cannot be copied through
+        // AddImageFromSource (for example Nikon scanner NEF). Retry only that
+        // failed path from full-size decoded pixels, preserving their color space.
+        var decoded = try ImageIOHelpers.loadImage(from: src, name: input.lastPathComponent)
+        if opaqueOnly && ImageIOHelpers.hasAlpha(decoded) { decoded = ImageIOHelpers.flatten(decoded) }
+        var retryProperties = ImageIOHelpers.portableMetadata(props, keepOrientation: false)
+        retryProperties[kCGImageDestinationLossyCompressionQuality] = options.imageQuality
+        guard let retry = CGImageDestinationCreateWithURL(output as CFURL, type.identifier as CFString, 1, nil) else {
+            throw KumquatError.encodeFailed(output.lastPathComponent)
+        }
+        CGImageDestinationAddImage(retry, decoded, retryProperties as CFDictionary)
+        guard CGImageDestinationFinalize(retry) else { throw KumquatError.encodeFailed(output.lastPathComponent) }
     }
 
     static func writeAnimatedGIF(from src: CGImageSource, to output: URL) throws {
@@ -110,7 +181,7 @@ public enum ImageConverter {
         for (dict, unclamped, clamped) in dictionaries {
             if let d = props[dict] as? [CFString: Any] {
                 let value = (d[unclamped] as? Double) ?? (d[clamped] as? Double) ?? 0
-                if value > 0 { return max(value, 0.02) }
+                if value > 0 { return value }
             }
         }
         return 0.1
@@ -121,13 +192,22 @@ public enum ImageConverter {
     static func writeWebP(_ input: URL, to output: URL, options: ConversionOptions, capabilities: Capabilities) async throws {
         let source = try ImageIOHelpers.source(input)
         let frameCount = CGImageSourceGetCount(source)
-        if frameCount > 1 {
+        // Icon containers store alternative resolutions, not an animation timeline.
+        // Treat their selected image just like the other still-image output paths.
+        let isIconContainer = ["ico", "icns"].contains(input.pathExtension.lowercased())
+        if frameCount > 1 && !isIconContainer {
             guard ["gif", "png", "apng"].contains(input.pathExtension.lowercased()) else {
                 throw KumquatError.processFailed("Multi-frame \(input.pathExtension.uppercased()) to WebP is not supported without discarding frames. No output was created.")
             }
             // Homebrew's webp package ships gif2webp alongside cwebp. It preserves GIF
             // disposal, timing and loop semantics directly, including transparent frames.
-            if input.pathExtension.lowercased() == "gif", let cwebp = capabilities.cwebpURL {
+            let hasVeryShortFrames = (0..<frameCount).contains {
+                frameDelay(ImageIOHelpers.properties(source, index: $0)) < 0.02
+            }
+            // gif2webp applies browser-style delay normalization to 10 ms GIFs.
+            // Our frame mux path preserves their literal timing instead.
+            if input.pathExtension.lowercased() == "gif", !hasVeryShortFrames,
+               let cwebp = capabilities.cwebpURL {
                 let converter = cwebp.deletingLastPathComponent().appendingPathComponent("gif2webp")
                 if FileManager.default.isExecutableFile(atPath: converter.path) {
                     try await ExternalTools.runChecked(converter, ["-quiet", "-mt", input.path, "-o", output.path])
@@ -135,21 +215,31 @@ public enum ImageConverter {
                     return
                 }
             }
-            guard let ffmpeg = capabilities.ffmpegURL else {
-                throw KumquatError.processFailed("Animated WebP conversion needs gif2webp or FFmpeg with libwebp_anim. The original animation was preserved; no still-image substitute was created.")
-            }
             let fileProperties = CGImageSourceCopyProperties(source, nil) as? [CFString: Any] ?? [:]
             let gif = fileProperties[kCGImagePropertyGIFDictionary] as? [CFString: Any] ?? [:]
             let png = fileProperties[kCGImagePropertyPNGDictionary] as? [CFString: Any] ?? [:]
             let loopCount: Int
             if input.pathExtension.lowercased() == "gif" {
-                // GIF stores repetitions after the initial play; WebP stores total plays.
-                // Match libwebp's gif2webp behavior, including play-once when no extension exists.
-                if let repeats = (gif[kCGImagePropertyGIFLoopCount] as? NSNumber)?.intValue {
-                    loopCount = repeats == 0 ? 0 : min(65_535, repeats + 1)
+                // ImageIO has already translated GIF's stored repetition count
+                // into total plays (raw 1 -> property 2), matching WebP's field.
+                // Adding one again would make the mux fallback loop once too often.
+                if let plays = (gif[kCGImagePropertyGIFLoopCount] as? NSNumber)?.intValue {
+                    loopCount = min(65_535, plays)
                 } else { loopCount = 1 }
             } else {
                 loopCount = (png[kCGImagePropertyAPNGLoopCount] as? NSNumber)?.intValue ?? 1
+            }
+            if let cwebp = capabilities.cwebpURL {
+                let mux = cwebp.deletingLastPathComponent().appendingPathComponent("webpmux")
+                if FileManager.default.isExecutableFile(atPath: mux.path) {
+                    try await writeAnimationWithWebPMux(source, to: output, cwebp: cwebp, mux: mux,
+                                                       loopCount: loopCount)
+                    try validateAnimation(output, against: source)
+                    return
+                }
+            }
+            guard let ffmpeg = capabilities.ffmpegURL else {
+                throw KumquatError.processFailed("Animated WebP conversion needs gif2webp, cwebp with webpmux, or FFmpeg with libwebp_anim. The original animation was preserved; no still-image substitute was created.")
             }
             // Lossless RGBA preserves alpha and avoids introducing halos between animation frames.
             try await ExternalTools.runChecked(ffmpeg, ["-y", "-loglevel", "error", "-i", input.path,
@@ -173,6 +263,31 @@ public enum ImageConverter {
         try encodeWebP(image, to: output, lossless: lossless, quality: options.webpQuality / 100)
     }
 
+    /// ImageIO supplies composited full-canvas APNG frames. Encoding each one as a
+    /// lossless WebP avoids depending on an optional FFmpeg libwebp_anim build.
+    private static func writeAnimationWithWebPMux(_ source: CGImageSource, to output: URL,
+                                                 cwebp: URL, mux: URL, loopCount: Int) async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("FileOrbit-animation-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        var arguments: [String] = []
+        for index in 0..<CGImageSourceGetCount(source) {
+            guard let frame = CGImageSourceCreateImageAtIndex(source, index, nil) else {
+                throw KumquatError.decodeFailed("Animation frame \(index + 1)")
+            }
+            let png = directory.appendingPathComponent("frame-\(index).png")
+            let webp = directory.appendingPathComponent("frame-\(index).webp")
+            try ImageIOHelpers.write(frame, to: png, type: .png)
+            try await ExternalTools.runChecked(cwebp, ["-quiet", "-mt", "-lossless", "-exact",
+                                                       png.path, "-o", webp.path])
+            let milliseconds = max(1, Int((frameDelay(ImageIOHelpers.properties(source, index: index)) * 1000).rounded()))
+            // Replace each full canvas; blending would accumulate semi-transparent pixels.
+            arguments += ["-frame", webp.path, "+\(milliseconds)+0+0+0-b"]
+        }
+        arguments += ["-loop", String(loopCount), "-bgcolor", "0,0,0,0", "-o", output.path]
+        try await ExternalTools.runChecked(mux, arguments)
+    }
+
     private static func validateAnimation(_ output: URL, against source: CGImageSource) throws {
         let encoded = try ImageIOHelpers.source(output)
         let count = CGImageSourceGetCount(source)
@@ -182,7 +297,9 @@ public enum ImageConverter {
         for index in 0..<count {
             let before = frameDelay(ImageIOHelpers.properties(source, index: index))
             let after = frameDelay(ImageIOHelpers.properties(encoded, index: index))
-            guard abs(before - after) < 0.021 else {
+            // WebP stores integer milliseconds. Allow rounding, not an entire
+            // 20 ms frame: the latter hid doubled durations for fast APNG input.
+            guard abs(before - after) < 0.0011 else {
                 throw KumquatError.encodeFailed("Animated WebP: frame timing could not be preserved")
             }
         }
@@ -225,24 +342,45 @@ public enum ImageConverter {
               let ctx = CGContext(consumer: consumer, mediaBox: nil, nil)
         else { throw KumquatError.encodeFailed(output.lastPathComponent) }
         for url in images {
+            try rejectUnsupportedAPNGPoster(url)
             let src = try ImageIOHelpers.source(url)
-            let props = ImageIOHelpers.properties(src)
-            let image = try ImageIOHelpers.loadImage(from: src, name: url.lastPathComponent)
-            let dpi = max(72, (props[kCGImagePropertyDPIWidth] as? Double) ?? 72)
-            var box = CGRect(x: 0, y: 0, width: Double(image.width) * 72 / dpi, height: Double(image.height) * 72 / dpi)
-            // Camera photos claim 72 dpi, which would make 40-inch pages. Keep pages at most
-            // A4-sized; the pixels are untouched, they just print at a higher resolution.
-            let longest = max(box.width, box.height)
-            if longest > 842 {
-                box.size = CGSize(width: box.width * 842 / longest, height: box.height * 842 / longest)
+            let count = ["tif", "tiff"].contains(url.pathExtension.lowercased()) ? CGImageSourceGetCount(src) : 1
+            for index in 0..<count {
+                let props = ImageIOHelpers.properties(src, index: index)
+                let image = try loadPage(src, index: index, name: url.lastPathComponent)
+                let dpi = max(72, (props[kCGImagePropertyDPIWidth] as? Double) ?? 72)
+                var box = CGRect(x: 0, y: 0, width: Double(image.width) * 72 / dpi, height: Double(image.height) * 72 / dpi)
+                // Camera photos claim 72 dpi, which would make 40-inch pages. Keep pages at most
+                // A4-sized; the pixels are untouched, they just print at a higher resolution.
+                let longest = max(box.width, box.height)
+                if longest > 842 {
+                    box.size = CGSize(width: box.width * 842 / longest, height: box.height * 842 / longest)
+                }
+                let drawable = pdfDrawableImage(image, quality: quality) ?? image
+                ctx.beginPage(mediaBox: &box)
+                ctx.interpolationQuality = .high
+                ctx.draw(drawable, in: box)
+                ctx.endPage()
             }
-            let drawable = pdfDrawableImage(image, quality: quality) ?? image
-            ctx.beginPage(mediaBox: &box)
-            ctx.interpolationQuality = .high
-            ctx.draw(drawable, in: box)
-            ctx.endPage()
         }
         ctx.closePDF()
+    }
+
+    private static func loadPage(_ source: CGImageSource, index: Int, name: String) throws -> CGImage {
+        if index == 0 { return try ImageIOHelpers.loadImage(from: source, name: name) }
+        let props = ImageIOHelpers.properties(source, index: index)
+        if ImageIOHelpers.orientation(props) == .up,
+           let image = CGImageSourceCreateImageAtIndex(source, index, nil) { return image }
+        let size = ImageIOHelpers.pixelSize(props)
+        let options: [CFString: Any] = [
+            kCGImageSourceCreateThumbnailFromImageAlways: true,
+            kCGImageSourceCreateThumbnailWithTransform: true,
+            kCGImageSourceThumbnailMaxPixelSize: max(size.width, size.height),
+        ]
+        guard let image = CGImageSourceCreateThumbnailAtIndex(source, index, options as CFDictionary) else {
+            throw KumquatError.decodeFailed("\(name), page \(index + 1)")
+        }
+        return image
     }
 
     static func pdfDrawableImage(_ image: CGImage, quality: Double) -> CGImage? {
@@ -262,16 +400,23 @@ public enum ImageConverter {
                           recognizer: (CGImage, [String]) throws -> [String] = {
                               try TextRecognizer.recognizeText(in: $0, languages: $1)
                           }) throws {
-        let image = try ImageIOHelpers.loadImage(input)
+        try rejectUnsupportedAPNGPoster(input)
+        let source = try? ImageIOHelpers.source(input)
+        let count = ["tif", "tiff"].contains(input.pathExtension.lowercased()) ? source.map(CGImageSourceGetCount) ?? 1 : 1
         var doc = DocxDocument(title: OutputNaming.baseName(of: input))
-        let embedded = try embeddableImageData(image)
-        doc.append(DocxImage.fitted(data: embedded.data, fileExtension: embedded.ext,
-                                    pixelWidth: image.width, pixelHeight: image.height,
-                                    maxWidth: doc.textWidth, maxHeight: doc.textHeight * 0.9))
-        let ocrImage = downscaled(image, maxPixel: 4096)
-        let paragraphs = try recognizer(ocrImage, options.recognitionLanguages)
-        for text in paragraphs {
-            doc.append(DocxParagraph(text))
+        for index in 0..<count {
+            if index > 0 { doc.appendPageBreak() }
+            let image = try source.map { try loadPage($0, index: index, name: input.lastPathComponent) }
+                ?? ImageIOHelpers.loadImage(input)
+            let embedded = try embeddableImageData(image)
+            doc.append(DocxImage.fitted(data: embedded.data, fileExtension: embedded.ext,
+                                        pixelWidth: image.width, pixelHeight: image.height,
+                                        maxWidth: doc.textWidth, maxHeight: doc.textHeight * 0.9))
+            let ocrImage = downscaled(image, maxPixel: 4096)
+            let paragraphs = try recognizer(ocrImage, options.recognitionLanguages)
+            for text in paragraphs {
+                doc.append(DocxParagraph(text))
+            }
         }
         try DocxWriter.write(doc, to: output)
     }

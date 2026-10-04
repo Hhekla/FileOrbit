@@ -36,6 +36,7 @@ public enum PDFConverter {
     static func renderPages(_ input: URL, format: OutputFormat, options: ConversionOptions,
                             progress: ((Double) -> Void)?) throws -> [URL] {
         let doc = try PDFRenderer.document(at: input)
+        guard let annotatedDoc = PDFDocument(url: input) else { throw KumquatError.decodeFailed(input.lastPathComponent) }
         let count = doc.numberOfPages
         guard count > 0 else { throw KumquatError.nothingToDo("\(input.lastPathComponent) has no pages.") }
         let type = ImageIOHelpers.utType(for: format)
@@ -45,7 +46,7 @@ public enum PDFConverter {
             : [kCGImagePropertyDPIWidth: options.pdfDPI, kCGImagePropertyDPIHeight: options.pdfDPI]
 
         func renderPage(_ number: Int, to url: URL) throws {
-            guard let page = doc.page(at: number),
+            guard let page = annotatedDoc.page(at: number - 1),
                   let image = PDFRenderer.render(page, dpi: options.pdfDPI)
             else { throw KumquatError.decodeFailed("page \(number) of \(input.lastPathComponent)") }
             try ImageIOHelpers.write(image, to: url, type: type, properties: props)
@@ -72,22 +73,31 @@ public enum PDFConverter {
     // MARK: - Text
 
     /// Embedded text when there is any; pages without text (scans) go through OCR.
-    public static func extractText(_ input: URL, options: ConversionOptions) throws -> String {
+    public static func extractText(_ input: URL, options: ConversionOptions,
+                                   recognizer: (CGImage, [String]) throws -> [String] = {
+                                       try TextRecognizer.recognizeText(in: $0, languages: $1)
+                                   }) throws -> String {
         guard let doc = PDFDocument(url: input) else { throw KumquatError.decodeFailed(input.lastPathComponent) }
         let cgDoc = try PDFRenderer.document(at: input)
         var pages: [String] = []
         guard doc.pageCount > 0 else { throw KumquatError.nothingToDo("PDF 没有可读取的页面。") }
         for i in 0..<doc.pageCount {
             try Task.checkCancellation()
-            let text = doc.page(at: i)?.string?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-            if !text.isEmpty {
+            let pageText = doc.page(at: i)?.string?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            let fields = doc.page(at: i).map(formFieldText) ?? []
+            let text = ([pageText] + fields).filter { !$0.isEmpty }.joined(separator: "\n")
+            if !pageText.isEmpty {
                 pages.append(text)
             } else {
                 guard let page = cgDoc.page(at: i + 1), let image = PDFRenderer.render(page, dpi: 200) else {
                     throw KumquatError.decodeFailed("PDF 第 \(i + 1) 页")
                 }
-                let paragraphs = try TextRecognizer.recognizeText(in: image, languages: options.recognitionLanguages)
-                pages.append(paragraphs.joined(separator: "\n\n"))
+                let paragraphs = try recognizer(image, options.recognitionLanguages)
+                let recognized = paragraphs.joined(separator: "\n\n").trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !recognized.isEmpty || !fields.isEmpty else {
+                    throw KumquatError.nothingToDo("PDF 第 \(i + 1) 页没有可提取或识别的文字；未生成空白或缺页的文本文件。")
+                }
+                pages.append(([recognized] + fields).filter { !$0.isEmpty }.joined(separator: "\n"))
             }
         }
         return pages.joined(separator: "\n\n\u{0C}\n\n").trimmingCharacters(in: .whitespacesAndNewlines) + "\n"
@@ -119,8 +129,7 @@ public enum PDFConverter {
             if i > 0 { docx.appendPageBreak() }
             guard let page = doc.page(at: i) else { throw KumquatError.decodeFailed("PDF 第 \(i + 1) 页") }
             if options.pdfDocxMode == .preserveAppearance {
-                guard let cgPage = cgDoc.page(at: i + 1),
-                      let image = PDFRenderer.render(cgPage, dpi: 150) else {
+                guard let image = PDFRenderer.render(page, dpi: 150) else {
                     throw KumquatError.decodeFailed("PDF 第 \(i + 1) 页")
                 }
                 let png = try ImageIOHelpers.encode(image, type: .png)
@@ -129,6 +138,7 @@ public enum PDFConverter {
                                              maxHeight: docx.textHeight * 0.94))
             } else {
                 let lines = styledLines(page)
+                let fields = formFieldText(page)
                 if lines.isEmpty {
                     guard let cgPage = cgDoc.page(at: i + 1),
                           let image = PDFRenderer.render(cgPage, dpi: 200) else {
@@ -137,16 +147,29 @@ public enum PDFConverter {
                     let recognized = try recognizer(image, options.recognitionLanguages)
                         .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
                         .filter { !$0.isEmpty }
-                    guard !recognized.isEmpty else {
+                    guard !recognized.isEmpty || !fields.isEmpty else {
                         throw KumquatError.processFailed("PDF 第 \(i + 1) 页没有提取或识别到文字，未生成空白 Word。请检查该页；若需保留图像，可选择页面图片模式（macOS 文本编辑不显示这些图片）。")
                     }
                     for p in recognized { docx.append(DocxParagraph(p)) }
                 } else {
                     for paragraph in paragraphs(from: lines) { docx.append(paragraph) }
                 }
+                for field in fields { docx.append(DocxParagraph(field)) }
             }
         }
         return docx
+    }
+
+    static func formFieldText(_ page: PDFPage) -> [String] {
+        page.annotations.compactMap { annotation in
+            guard annotation.shouldDisplay,
+                  annotation.type?.trimmingCharacters(in: CharacterSet(charactersIn: "/")) == "Widget",
+                  let value = annotation.widgetStringValue?.trimmingCharacters(in: .whitespacesAndNewlines),
+                  !value.isEmpty else { return nil }
+            if annotation.widgetFieldType == .button && value == "Off" { return nil }
+            if let name = annotation.fieldName, !name.isEmpty { return "\(name): \(value)" }
+            return value
+        }
     }
 
     static func styledLines(_ page: PDFPage) -> [StyledLine] {
@@ -248,4 +271,3 @@ public enum PDFConverter {
         return result
     }
 }
-

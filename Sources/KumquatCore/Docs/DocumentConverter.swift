@@ -6,7 +6,8 @@ public enum DocumentConverter {
         let destination = OutputNaming.convertedURL(for: input, ext: format.fileExtension)
         // The HTML importer uses WebKit and AppKit text drawing expects the main thread.
         let output = try await MainActor.run { () throws -> URL in
-            let document = try read(input)
+            let document = input.pathExtension.lowercased() == "docx"
+                ? try readDocx(input, target: format) : try read(input)
             return try OutputNaming.write(to: destination) { out in
                 try write(document, as: format, to: out, title: OutputNaming.baseName(of: input))
             }
@@ -20,6 +21,8 @@ public enum DocumentConverter {
     public static func read(_ url: URL) throws -> NSAttributedString {
         let ext = url.pathExtension.lowercased()
         switch ext {
+        case "docx":
+            return try readDocx(url)
         case "md", "markdown":
             let text = try readPlainText(url)
             return MarkdownBridge.attributedString(fromMarkdown: text)
@@ -49,6 +52,14 @@ public enum DocumentConverter {
         }
     }
 
+    @MainActor
+    static func readDocx(_ url: URL, target: OutputFormat? = nil) throws -> NSAttributedString {
+        let data = try DocxImport.preparedData(url, target: target)
+        do {
+            return try NSAttributedString(data: data, options: [.documentType: NSAttributedString.DocumentType.officeOpenXML], documentAttributes: nil)
+        } catch { throw KumquatError.decodeFailed(url.lastPathComponent) }
+    }
+
     static func readPlainText(_ url: URL) throws -> String {
         var encoding = String.Encoding.utf8
         if let text = try? String(contentsOf: url, usedEncoding: &encoding) { return text }
@@ -67,6 +78,13 @@ public enum DocumentConverter {
     @MainActor
     public static func write(_ document: NSAttributedString, as format: OutputFormat, to url: URL, title: String) throws {
         let range = NSRange(location: 0, length: document.length)
+        var attachments: [NSTextAttachment] = []
+        document.enumerateAttribute(.attachment, in: range) { value, _, _ in
+            if let attachment = value as? NSTextAttachment { attachments.append(attachment) }
+        }
+        if !attachments.isEmpty, [OutputFormat.docx, .rtf, .odt].contains(format) {
+            throw KumquatError.processFailed("当前\(format.title)导出不能保留文档附件图片，已停止以避免缺图。请使用 PDF 或 HTML，或提取 TXT/Markdown 正文。")
+        }
         func export(_ type: NSAttributedString.DocumentType) throws {
             let data = try document.data(from: range, documentAttributes: [.documentType: type, .title: title])
             try data.write(to: url)
@@ -75,9 +93,25 @@ public enum DocumentConverter {
         case .docx: try export(.officeOpenXML)
         case .rtf: try export(.rtf)
         case .odt: try export(.openDocument)
-        case .html: try export(.html)
+        case .html:
+            let data = try document.data(from: range, documentAttributes: [.documentType: NSAttributedString.DocumentType.html, .title: title])
+            guard var html = String(data: data, encoding: .utf8) else { throw KumquatError.encodeFailed(url.lastPathComponent) }
+            let expression = try NSRegularExpression(pattern: "(<img\\b[^>]*\\bsrc=\")[^\"]*(\")", options: .caseInsensitive)
+            let matches = expression.matches(in: html, range: NSRange(html.startIndex..., in: html))
+            guard matches.count == attachments.count else { throw KumquatError.processFailed("HTML 图片数量与原文不一致，已停止导出以避免缺图。") }
+            for (match, attachment) in zip(matches, attachments).reversed() {
+                guard let original = attachment.fileWrapper?.regularFileContents,
+                      let image = NSImage(data: original), let tiff = image.tiffRepresentation,
+                      let bitmap = NSBitmapImageRep(data: tiff), let png = bitmap.representation(using: .png, properties: [:]),
+                      let replacementRange = Range(match.range, in: html) else {
+                    throw KumquatError.processFailed("此附件不能作为图片嵌入 HTML，已停止导出。")
+                }
+                let source = html as NSString
+                html.replaceSubrange(replacementRange, with: source.substring(with: match.range(at: 1)) + "data:image/png;base64," + png.base64EncodedString() + source.substring(with: match.range(at: 2)))
+            }
+            try html.write(to: url, atomically: false, encoding: .utf8)
         case .txt:
-            try document.string.write(to: url, atomically: false, encoding: .utf8)
+            try document.string.replacingOccurrences(of: "\u{fffc}", with: "[图片]").write(to: url, atomically: false, encoding: .utf8)
         case .md:
             try MarkdownBridge.markdown(from: document).write(to: url, atomically: false, encoding: .utf8)
         case .pdf:
@@ -137,4 +171,3 @@ public enum AttributedPDFRenderer {
         ctx.closePDF()
     }
 }
-

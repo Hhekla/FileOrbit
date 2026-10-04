@@ -54,7 +54,8 @@ enum MediaSupport {
         }
     }
 
-    /// Decodes every audio track to PCM and re-encodes with `outputSettings`.
+    /// Decodes the first audio track to PCM and re-encodes with `outputSettings`.
+    /// Independent language tracks are alternatives, not sounds to mix together.
     static func transcodeAudio(from input: URL, to output: URL, fileType: AVFileType,
                                readerSettings: [String: Any], outputSettings: [String: Any],
                                timeRange: CMTimeRange? = nil) async throws {
@@ -63,7 +64,7 @@ enum MediaSupport {
         guard !tracks.isEmpty else { throw KumquatError.nothingToDo("\(input.lastPathComponent) has no audio.") }
         let reader = try AVAssetReader(asset: asset)
         if let timeRange { reader.timeRange = timeRange }
-        let readerOutput = AVAssetReaderAudioMixOutput(audioTracks: tracks, audioSettings: readerSettings)
+        let readerOutput = AVAssetReaderAudioMixOutput(audioTracks: [tracks[0]], audioSettings: readerSettings)
         readerOutput.alwaysCopiesSampleData = false
         guard reader.canAdd(readerOutput) else { throw KumquatError.decodeFailed(input.lastPathComponent) }
         reader.add(readerOutput)
@@ -97,6 +98,65 @@ enum MediaSupport {
         if writer.status != .completed {
             throw KumquatError.processFailed(writer.error?.localizedDescription ?? "Writing failed.")
         }
+    }
+
+    /// Header-only metadata check for specific fidelity losses. This does not
+    /// decode the source or add warnings to ordinary single-track SDR files.
+    static func conversionWarnings(for input: URL, to format: OutputFormat,
+                                   capabilities: Capabilities) async -> [String] {
+        let asset = AVURLAsset(url: input)
+        let tracks = (try? await asset.load(.tracks)) ?? []
+        let readable = ((try? await asset.load(.isReadable)) ?? false) && !tracks.isEmpty
+        let nativeAudio = tracks.filter { $0.mediaType == .audio }
+        var audioCount = nativeAudio.count
+        var subtitleCount = tracks.filter { [.subtitle, .text, .closedCaption].contains($0.mediaType) }.count
+        var channels = await audioFormat(of: input).channels
+        var hdr = false
+        for track in tracks where track.mediaType == .video {
+            for description in (try? await track.load(.formatDescriptions)) ?? [] {
+                let extensions = (CMFormatDescriptionGetExtensions(description) as NSDictionary?) ?? [:]
+                let transfer = extensions[kCMFormatDescriptionExtension_TransferFunction] as? String
+                if transfer == kCVImageBufferTransferFunction_SMPTE_ST_2084_PQ as String
+                    || transfer == kCVImageBufferTransferFunction_ITU_R_2100_HLG as String { hdr = true }
+            }
+        }
+        // AVFoundation has no tracks for MKV/FLV and similar inputs. ffprobe
+        // also exposes codec color tags consistently for those containers.
+        let sibling = capabilities.ffmpegURL?.deletingLastPathComponent().appendingPathComponent("ffprobe")
+        let ffprobe = sibling.flatMap { FileManager.default.isExecutableFile(atPath: $0.path) ? $0 : nil }
+            ?? ExternalTools.locate("ffprobe")
+        if let ffprobe,
+           let result = try? await ExternalTools.run(ffprobe, ["-v", "error", "-show_streams", "-of", "json", input.path]),
+           result.status == 0,
+           let data = result.standardOutput.data(using: .utf8),
+           let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+           let streams = object["streams"] as? [[String: Any]] {
+            let audio = streams.filter { $0["codec_type"] as? String == "audio" }
+            audioCount = audio.count
+            channels = audio.first?["channels"] as? Int ?? channels
+            subtitleCount = streams.filter { $0["codec_type"] as? String == "subtitle" }.count
+            hdr = streams.contains { ["smpte2084", "arib-std-b67"].contains($0["color_transfer"] as? String ?? "") } || hdr
+        }
+        let audioOutput = [OutputFormat.m4a, .mp3, .wav, .aiff, .flac, .ogg, .opus, .wma].contains(format)
+        let selectsFirstVideoTracks = [OutputFormat.mkv, .webm, .avi, .wmv].contains(format)
+            || (!readable && [.mp4, .mov].contains(format))
+        var warnings: [String] = []
+        if audioCount > 1 && (audioOutput || selectsFirstVideoTracks) {
+            warnings.append("仅导出第一条音轨，其他语言或配音音轨不会包含在结果中。")
+        }
+        if subtitleCount > 0 && selectsFirstVideoTracks {
+            warnings.append("当前视频转换不保留独立字幕轨；请同时保留原文件。")
+        }
+        if format == .gif && (audioCount > 0 || subtitleCount > 0) {
+            warnings.append("GIF 仅包含画面，不包含声音或独立字幕轨。")
+        }
+        if channels > 2 && [.mp3, .wma].contains(format) {
+            warnings.append("此输出格式会将多声道音频混为双声道，不保留环绕声声道。")
+        }
+        if hdr && [.mkv, .avi, .wmv, .gif].contains(format) {
+            warnings.append("此转换不能保留完整 HDR 位深与色彩，请保留原片；需要保留 HDR 时优先选择 MOV。")
+        }
+        return warnings
     }
 
     static func audioFormat(of url: URL) async -> (sampleRate: Double, channels: Int) {
@@ -184,4 +244,3 @@ final class SamplePump: @unchecked Sendable {
         }
     }
 }
-

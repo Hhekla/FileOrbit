@@ -7,42 +7,60 @@ public enum AudioConverter {
         let destination = OutputNaming.convertedURL(for: input, ext: format.fileExtension)
         let readable = await MediaSupport.isReadable(input)
 
+        let source = await MediaSupport.audioFormat(of: input)
+        // The native AAC/PCM path previously reduced 5.1 input to stereo.
+        // Use the multichannel-capable encoder instead of silently losing channels.
         let needsFFmpeg = [.mp3, .ogg, .opus, .wma].contains(format) || !readable
+            || (source.channels > 2 && format != .flac)
         if needsFFmpeg {
             guard let ffmpeg = capabilities.ffmpegURL else {
                 throw readable ? KumquatError.toolMissing("ffmpeg")
                     : KumquatError.unsupportedInput("\(input.lastPathComponent) (install ffmpeg to open it)")
             }
-            return [try await OutputNaming.write(to: destination) { out in
-                try await ExternalTools.runChecked(ffmpeg, ["-y", "-loglevel", "error", "-i", input.path, "-vn"]
-                    + ffmpegAudioArguments(format) + [out.path])
-            }]
+            return [try await convertWithFFmpeg(input, to: destination, format: format, ffmpeg: ffmpeg)]
         }
 
-        let source = await MediaSupport.audioFormat(of: input)
-        let channels = min(source.channels, 2)
-        return [try await OutputNaming.write(to: destination) { out in
-            switch format {
-            case .m4a:
-                let rate = MediaSupport.aacSampleRate(for: source.sampleRate)
-                try await MediaSupport.transcodeAudio(
-                    from: input, to: out, fileType: .m4a,
-                    readerSettings: MediaSupport.pcmSettings(sampleRate: rate, channels: channels),
-                    outputSettings: MediaSupport.aacSettings(sampleRate: rate, channels: channels,
-                                                             bitRate: channels == 1 ? 128_000 : 256_000))
-            case .wav, .aiff:
-                let settings = MediaSupport.pcmSettings(sampleRate: source.sampleRate, channels: channels,
-                                                        bigEndian: format == .aiff)
-                try await MediaSupport.transcodeAudio(
-                    from: input, to: out, fileType: format == .wav ? .wav : .aiff,
-                    readerSettings: MediaSupport.pcmSettings(sampleRate: source.sampleRate, channels: channels),
-                    outputSettings: settings)
-            case .flac:
-                try writeFLAC(from: input, to: out)
-            default:
-                throw KumquatError.unsupportedConversion(from: input.pathExtension.uppercased(), to: format.title)
-            }
-        }]
+        let channels = source.channels
+        do {
+            return [try await OutputNaming.write(to: destination) { out in
+                switch format {
+                case .m4a:
+                    let rate = MediaSupport.aacSampleRate(for: source.sampleRate)
+                    try await MediaSupport.transcodeAudio(
+                        from: input, to: out, fileType: .m4a,
+                        readerSettings: MediaSupport.pcmSettings(sampleRate: rate, channels: channels),
+                        outputSettings: MediaSupport.aacSettings(sampleRate: rate, channels: channels,
+                                                                 bitRate: channels == 1 ? 128_000 : 256_000))
+                case .wav, .aiff:
+                    let settings = MediaSupport.pcmSettings(sampleRate: source.sampleRate, channels: channels,
+                                                            bigEndian: format == .aiff)
+                    try await MediaSupport.transcodeAudio(
+                        from: input, to: out, fileType: format == .wav ? .wav : .aiff,
+                        readerSettings: MediaSupport.pcmSettings(sampleRate: source.sampleRate, channels: channels),
+                        outputSettings: settings)
+                case .flac:
+                    try writeFLAC(from: input, to: out)
+                default:
+                    throw KumquatError.unsupportedConversion(from: input.pathExtension.uppercased(), to: format.title)
+                }
+            }]
+        } catch {
+            try Task.checkCancellation()
+            // AVFoundation can read a container that AVAudioFile cannot open
+            // (MPEG program/transport streams and some AMR inputs, for example).
+            // A native decoder error must not prevent an available real decode.
+            guard let ffmpeg = capabilities.ffmpegURL else { throw error }
+            return [try await convertWithFFmpeg(input, to: destination, format: format, ffmpeg: ffmpeg)]
+        }
+    }
+
+    private static func convertWithFFmpeg(_ input: URL, to destination: URL,
+                                          format: OutputFormat, ffmpeg: URL) async throws -> URL {
+        try await OutputNaming.write(to: destination) { out in
+            try await ExternalTools.runChecked(ffmpeg, ["-y", "-nostdin", "-loglevel", "error", "-i", input.path,
+                                                        "-map", "0:a:0", "-vn", "-sn", "-dn"]
+                + ffmpegAudioArguments(format) + [out.path])
+        }
     }
 
     static func ffmpegAudioArguments(_ format: OutputFormat) -> [String] {

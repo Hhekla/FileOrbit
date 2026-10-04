@@ -94,6 +94,10 @@ public struct ConversionEngine: Sendable {
                 switch action {
                 case .convert(let format):
                     report.outputs += try await convert(url, to: format)
+                    if [.audio, .video].contains(FileClassifier.kind(of: url)) {
+                        report.warnings += await MediaSupport.conversionWarnings(for: url, to: format, capabilities: capabilities)
+                            .map { "\(url.lastPathComponent)：\($0)" }
+                    }
                 case .tool(.compress):
                     let before = FileClassifier.fileSize(of: url)
                     let output = try await compress(url)

@@ -142,6 +142,21 @@ final class DocumentRegressionTests: XCTestCase {
         XCTAssertEqual(try Data(contentsOf: result.appendingPathComponent("folder/nested.bin")), Data([1, 2, 3]))
     }
 
+    func testZipUnicodePathsAreMarkedUTF8ForIndependentReaders() async throws {
+        let input = try file("中文文件.txt", "Exact payload")
+        let results = try await ArchiveConverter.convert(input, to: .zip)
+        let bytes = [UInt8](try Data(contentsOf: XCTUnwrap(results.first)))
+        XCTAssertEqual(Array(bytes.prefix(4)), [0x50, 0x4b, 0x03, 0x04])
+        XCTAssertNotEqual((UInt16(bytes[6]) | UInt16(bytes[7]) << 8) & 0x0800, 0,
+                          "Local ZIP header must identify UTF-8 filenames")
+        let central = try XCTUnwrap((0..<(bytes.count - 10)).first {
+            Array(bytes[$0..<($0 + 4)]) == [0x50, 0x4b, 0x01, 0x02]
+        })
+        XCTAssertNotEqual((UInt16(bytes[central + 8]) | UInt16(bytes[central + 9]) << 8) & 0x0800, 0,
+                          "Central ZIP header must identify UTF-8 filenames")
+        XCTAssertNotNil(Data(bytes).range(of: Data(input.lastPathComponent.utf8)))
+    }
+
     func testArchiveUnicodeNamesAndRawGzipExpandedSizeLimit() async throws {
         let input = try file("数据 一.txt", String(repeating: "x", count: 32_768))
         for format in [OutputFormat.zip, .tar, .gz] {

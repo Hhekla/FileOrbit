@@ -1,7 +1,25 @@
 import CoreGraphics
 import Foundation
+import PDFKit
 
 public enum PDFRenderer {
+    /// CoreGraphics renders page streams but omits annotation appearances, including
+    /// filled form fields. Use PDFKit for pages with visible annotations.
+    public static func render(_ page: PDFPage, dpi: Double) -> CGImage? {
+        guard let raw = page.pageRef else { return nil }
+        guard page.annotations.contains(where: \.shouldDisplay) else { return render(raw, dpi: dpi) }
+        guard dpi.isFinite, dpi > 0, dpi <= 1200 else { return nil }
+        let box = raw.getBoxRect(.cropBox)
+        let rotation = ((Int(raw.rotationAngle) % 360) + 360) % 360
+        let scale = dpi / 72
+        let width = ((rotation == 90 || rotation == 270 ? box.height : box.width) * scale).rounded()
+        let height = ((rotation == 90 || rotation == 270 ? box.width : box.height) * scale).rounded()
+        guard width.isFinite, height.isFinite, width > 0, height > 0,
+              width <= 32_768, height <= 32_768, width * height <= 100_000_000 else { return nil }
+        let thumbnail = page.thumbnail(of: CGSize(width: width, height: height), for: .cropBox)
+        return thumbnail.cgImage(forProposedRect: nil, context: nil, hints: nil)
+    }
+
     /// Rasterizes a page at the given DPI on a white background, honouring /Rotate.
     public static func render(_ page: CGPDFPage, dpi: Double) -> CGImage? {
         guard dpi.isFinite, dpi > 0, dpi <= 1200 else { return nil }
@@ -59,4 +77,3 @@ public enum PDFRenderer {
         return doc
     }
 }
-

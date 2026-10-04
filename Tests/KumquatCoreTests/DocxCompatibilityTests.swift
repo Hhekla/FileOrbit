@@ -199,4 +199,20 @@ final class DocxCompatibilityTests: XCTestCase {
         XCTAssertFalse(FileManager.default.fileExists(atPath: destination.path))
         XCTAssertTrue(FileManager.default.fileExists(atPath: input.path))
     }
+
+    func testTextExtractionRejectsEmptyRecognitionOnAnyPageWithoutPublishingPartialText() throws {
+        let input = try makePDF("partial-text", pages: [.text(["First page text"]), .scanned])
+        let destination = directory.appendingPathComponent("partial-text.txt")
+        let original = try Data(contentsOf: input)
+        for recognized in [[], [" \n\t " ]] {
+            XCTAssertThrowsError(try OutputNaming.write(to: destination) { pending in
+                let text = try PDFConverter.extractText(input, options: ConversionOptions()) { _, _ in recognized }
+                try text.write(to: pending, atomically: false, encoding: .utf8)
+            }) { error in
+                XCTAssertTrue(ConversionEngine.message(for: error).contains("第 2 页"))
+            }
+            XCTAssertFalse(FileManager.default.fileExists(atPath: destination.path))
+        }
+        XCTAssertEqual(try Data(contentsOf: input), original)
+    }
 }

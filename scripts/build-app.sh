@@ -2,7 +2,7 @@
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
-VERSION="${FILEORBIT_VERSION:-0.1.0-alpha.3}"
+VERSION="${FILEORBIT_VERSION:-0.1.0-alpha.5}"
 CONFIG="${FILEORBIT_CONFIGURATION:-release}"
 export CLANG_MODULE_CACHE_PATH="${CLANG_MODULE_CACHE_PATH:-$ROOT/.build/clang-cache}"
 export SWIFTPM_MODULECACHE_OVERRIDE="${SWIFTPM_MODULECACHE_OVERRIDE:-$ROOT/.build/swift-cache}"
